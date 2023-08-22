@@ -1,110 +1,120 @@
 #include <iostream>
 #include <set>
-#include <algorithm>
 #include <optional>
 #include <chrono>
+#include <thread>
+#include <mutex>
+#include <map>
+#include <exception>
+#include <string>
+#include <sqlite3.h>
+#include <boost/asio.hpp>
+#include <boost/asio/spawn.hpp>
 
-class Player {
-public:
-    // Constructor to initialize a player with their unique ID and rank.
-    Player(int id, int rank) 
-        : id(id), rank(rank), timestamp(std::chrono::system_clock::now()) {}
-    
-    // Get the player's unique ID.
-    int getId() const { return id; }
-
-    // Get the player's rank.
-    int getRank() const { return rank; }
-
-    // Get the timestamp when the player was added to the matchmaking pool.
-    auto getTimestamp() const { return timestamp; }
-
-    // Overload the '<' operator to enable sorting players by rank in the set.
-    bool operator<(const Player& other) const {
-        return rank < other.rank;
-    }
-
+// 1. Error Handling
+class MatchmakingException : public std::exception {
 private:
-    int id;  // Player's unique ID.
-    int rank;  // Player's rank.
-
-    // The time point when the player was added to the matchmaking pool.
-    std::chrono::system_clock::time_point timestamp;
+    std::string message;
+public:
+    MatchmakingException(const std::string& msg) : message(msg) {}
+    const char* what() const noexcept override { return message.c_str(); }
 };
 
-class Matchmaking {
+// 2. Database Management
+class Database {
+private:
+    sqlite3* db;
+    std::mutex dbMutex; // To make database operations thread-safe
 public:
-    // Add a player to the matchmaking pool.
-    void addPlayer(const Player& player) {
-        pool.insert(player);
-    }
-
-    // Find the best match for a given player within a certain rank tolerance.
-    // If no match is found within the initial tolerance, it incrementally increases 
-    // until a match is found or a maximum tolerance is reached.
-    std::optional<Player> findBestMatch(const Player& player, int initial_tolerance = 5, int max_tolerance = 50) {
-        int rank = player.getRank();
-        int tolerance = initial_tolerance;
-
-        while (tolerance <= max_tolerance) {
-            // Define the lower and upper bounds of the search range.
-            auto lower = pool.lower_bound(Player(0, rank - tolerance));
-            auto upper = pool.upper_bound(Player(0, rank + tolerance));
-
-            Player* bestMatch = nullptr;
-            auto oldestTimestamp = std::chrono::system_clock::now();
-
-            // Iterate through the range to find the best match based on rank 
-            // and time they've been in the pool (prioritizing older entries).
-            for (auto it = lower; it != upper; ++it) {
-                if (it->getId() != player.getId() && it->getTimestamp() < oldestTimestamp) {
-                    bestMatch = const_cast<Player*>(&(*it));
-                    oldestTimestamp = it->getTimestamp();
-                }
-            }
-
-            // If a match is found, remove them from the pool and return.
-            if (bestMatch) {
-                pool.erase(*bestMatch);
-                return *bestMatch;
-            }
-
-            // Increase tolerance for the next iteration.
-            tolerance += 5;
+    Database(const std::string& filename) {
+        if (sqlite3_open(filename.c_str(), &db)) {
+            throw MatchmakingException("Failed to open database.");
         }
 
-        // Return empty if no match is found within max tolerance.
-        return {};
+        char* errMsg = nullptr;
+        std::string sql = "CREATE TABLE IF NOT EXISTS MatchmakingHistory(Player1Id INT, Player2Id INT);";
+        
+        if (sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &errMsg)) {
+            throw MatchmakingException("Failed to create table.");
+        }
     }
 
-private:
-    // A set (sorted data structure) to maintain the pool of players waiting for a match.
-    std::set<Player> pool;
+    void insertMatch(int player1Id, int player2Id) {
+        std::lock_guard<std::mutex> lock(dbMutex);
+        
+        char* errMsg = nullptr;
+        std::string sql = "INSERT INTO MatchmakingHistory (Player1Id, Player2Id) VALUES (" 
+                          + std::to_string(player1Id) + "," + std::to_string(player2Id) + ");";
+        
+        if (sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &errMsg)) {
+            throw MatchmakingException("Failed to insert match.");
+        }
+    }
+
+    ~Database() {
+        sqlite3_close(db);
+    }
 };
+
+// 3. Player and Matchmaking
+// ... (Include the Player and Matchmaking classes from previous examples, and make sure methods like addPlayer are thread-safe using mutexes.)
+
+// 4. Networking
+void handlePlayer(boost::asio::ip::tcp::socket socket, Matchmaking& matchmaking, boost::asio::yield_context yield) {
+    try {
+        boost::asio::streambuf buf;
+
+        // Simple receive. Assume players send their ID and rank in a format "ID,RANK"
+        boost::asio::async_read_until(socket, buf, '\n', yield);
+        std::istream is(&buf);
+        std::string data;
+        std::getline(is, data);
+        int commaPos = data.find(',');
+        int id = std::stoi(data.substr(0, commaPos));
+        int rank = std::stoi(data.substr(commaPos + 1));
+
+        Player player(id, rank);
+        matchmaking.addPlayer(player);
+
+    }
+    catch (const std::exception& e) {
+        std::cerr << "Error handling player: " << e.what() << std::endl;
+    }
+}
+
+void startAccept(boost::asio::ip::tcp::acceptor& acceptor, Matchmaking& matchmaking, boost::asio::yield_context yield) {
+    while (true) {
+        boost::system::error_code ec;
+        boost::asio::ip::tcp::socket socket(acceptor.get_executor().context());
+        acceptor.async_accept(socket, yield[ec]);
+
+        if (!ec) {
+            boost::asio::spawn(acceptor.get_executor(), [&socket, &matchmaking](boost::asio::yield_context yc) {
+                handlePlayer(std::move(socket), matchmaking, yc);
+            });
+        } else {
+            std::cerr << "Accept error: " << ec.message() << std::endl;
+        }
+    }
+}
+
+void server(Matchmaking& matchmaking) {
+    boost::asio::io_context io_context(4);  // 4 threads in the thread pool
+    boost::asio::ip::tcp::acceptor acceptor(io_context, boost::asio::ip::tcp::endpoint(boost::asio::ip::tcp::v4(), 12345));
+
+    boost::asio::spawn(io_context, [&acceptor, &matchmaking](boost::asio::yield_context yield) {
+        startAccept(acceptor, matchmaking, yield);
+    });
+
+    io_context.run();
+}
 
 int main() {
     Matchmaking matchmaking;
+    Database db("matchmaking.db");
 
-    // Create some sample players.
-    Player player1(1, 1500);
-    Player player2(2, 1505);
-    Player player3(3, 1520);
-    Player player4(4, 1600);
-
-    // Add the sample players to the matchmaking pool.
-    matchmaking.addPlayer(player1);
-    matchmaking.addPlayer(player2);
-    matchmaking.addPlayer(player3);
-    matchmaking.addPlayer(player4);
-
-    // Attempt to find a match for player1.
-    auto match = matchmaking.findBestMatch(player1);
-    if (match) {
-        std::cout << "Player with ID: " << player1.getId() << " (Rank: " << player1.getRank() 
-                  << ") matched with Player ID: " << match->getId() << " (Rank: " << match->getRank() << ")\n";
-    } else {
-        std::cout << "No suitable match found for Player ID: " << player1.getId() << "\n";
-    }
+    // For simplicity, run the server in main thread
+    server(matchmaking);
 
     return 0;
 }
